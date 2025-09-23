@@ -54,25 +54,46 @@ else:
     PRESET_OPTIONS = {
         "Manual": {},
         "Home SRVCS Acquisition (No History)": {
-            '$ Income': 0.10, '$ Home Value': 0.10, 'Owner Occupied': 0.00,
-            'Median Year Structure Built': 0.05, 'House Count': 0.15,
-            'House Penetration%': 0.00, '$ Total Spend': 0.00, 'Total Visits': 0.00,
-            '$ Average Order': 0.00, 'Distance': 0.10,
-            'Weighted Penetration Score': 0.20, 'Customer Profile Match Score': 0.30
+            '$ Income': 0.25,
+            '$ Home Value': 0.15,
+            'Owner Occupied': 0.30,
+            'Median Year Structure Built': 0.05,
+            'House Count': 0.00,
+            'House Penetration%': 0.00,
+            '$ Total Spend': 0.00,
+            'Total Visits': 0.00,
+            '$ Average Order': 0.00,
+            'Distance': 0.25,
+            'Weighted Penetration Score': 0.00,
+            'Customer Profile Match Score': 0.00
         },
         "Home SRVCS Acquisition (With History + Suppression)": {
-            '$ Income': 0.05, '$ Home Value': 0.05, 'Owner Occupied': 0.00,
-            'Median Year Structure Built': 0.05, 'House Count': 0.10,
-            'House Penetration%': 0.05, '$ Total Spend': 0.00, 'Total Visits': 0.00,
-            '$ Average Order': 0.00, 'Distance': 0.10,
-            'Weighted Penetration Score': 0.20, 'Customer Profile Match Score': 0.40
+            '$ Income': 0.05,
+            '$ Home Value': 0.05,
+            'Owner Occupied': 0.15,
+            'Median Year Structure Built': 0.03,
+            'House Count': 0.10,
+            'House Penetration%': 0.05,
+            '$ Total Spend': 0.07,
+            'Total Visits': 0.03,
+            '$ Average Order': 0.05,
+            'Distance': 0.07,
+            'Weighted Penetration Score': 0.15,
+            'Customer Profile Match Score': 0.20
         },
         "Home SRVCS Acquisition (With History, No Suppression)": {
-            '$ Income': 0.05, '$ Home Value': 0.05, 'Owner Occupied': 0.00,
-            'Median Year Structure Built': 0.05, 'House Count': 0.10,
-            'House Penetration%': 0.10, '$ Total Spend': 0.10, 'Total Visits': 0.05,
-            '$ Average Order': 0.05, 'Distance': 0.05,
-            'Weighted Penetration Score': 0.20, 'Customer Profile Match Score': 0.20
+            '$ Income': 0.05,
+            '$ Home Value': 0.05,
+            'Owner Occupied': 0.10,
+            'Median Year Structure Built': 0.02,
+            'House Count': 0.13,
+            'House Penetration%': 0.13,
+            '$ Total Spend': 0.13,
+            'Total Visits': 0.07,
+            '$ Average Order': 0.10,
+            'Distance': 0.07,
+            'Weighted Penetration Score': 0.05,
+            'Customer Profile Match Score': 0.10
         }
     }
 
@@ -87,11 +108,18 @@ else:
     # Fallback weights if "Manual" selected or preset is empty
     if not DEFAULT_WEIGHTS:
         DEFAULT_WEIGHTS = {
-            '$ Income': 0.20, '$ Home Value': 0.15, 'Owner Occupied': 0.15,
-            'Median Year Structure Built': 0.05, 'House Count': 0.10,
-            'House Penetration%': 0.10, '$ Total Spend': 0.10, 'Total Visits': 0.05,
-            '$ Average Order': 0.05, 'Distance': 0.05,
-            'Weighted Penetration Score': 0.10, 'Customer Profile Match Score': 0.10
+            '$ Income': 0.20,
+            '$ Home Value': 0.15,
+            'Owner Occupied': 0.15,
+            'Median Year Structure Built': 0.05,
+            'House Count': 0.10,
+            'House Penetration%': 0.10,
+            '$ Total Spend': 0.10,
+            'Total Visits': 0.05,
+            '$ Average Order': 0.05,
+            'Distance': 0.05,
+            'Weighted Penetration Score': 0.10,
+            'Customer Profile Match Score': 0.10
         }
 
     # --- Upload penetration report file ---
@@ -101,7 +129,7 @@ else:
         # Load the file into DataFrame
         if uploaded_file.name.lower().endswith('.csv'):
             df = pd.read_csv(uploaded_file)
-        else:
+        elif uploaded_file.name.lower().endswith('.xlsx'):
             df = pd.read_excel(uploaded_file)
 
         st.write("✅ File loaded:", uploaded_file.name)
@@ -126,22 +154,29 @@ else:
         max_penetration = st.sidebar.number_input("Max House Penetration (%)", value=100.0)
 
         # --- Select profile match mode ---
-        profile_mode = st.sidebar.radio("Customer Profile Mode", ["Dynamic (from file)", "Fixed Standard"])
-        if profile_mode == "Fixed Standard":
-            st.sidebar.header("Fixed Standard Values")
-            ideal_income = st.sidebar.number_input("Ideal Income", value=65000)
-            ideal_home_value = st.sidebar.number_input("Ideal Home Value", value=180000)
-            ideal_owner = st.sidebar.number_input("Ideal Owner Occupied %", value=75)
-            ideal_year_built = st.sidebar.number_input("Ideal Median Year Built", value=1995)
-            ideal_distance = st.sidebar.number_input("Ideal Distance (miles for Profile Match)", value=25)
+        st.sidebar.header("Customer Profile Mode")
+        if preset_choice == "Home SRVCS Acquisition (No History)":
+            profile_mode = "Fixed Standard"
+            st.sidebar.info("Profile Mode set to 'Fixed Standard' for this preset.")
         else:
-            # Dynamic profile based on existing customers in file
-            customer_rows = df[df['House Penetration%'] > 0]
-            ideal_income = customer_rows['$ Income'].mean()
-            ideal_home_value = customer_rows['$ Home Value'].mean()
-            ideal_owner = customer_rows['Owner Occupied'].mean()
-            ideal_year_built = customer_rows['Median Year Structure Built'].mean()
-            ideal_distance = customer_rows['Distance'].mean()
+            profile_mode = st.sidebar.radio("Customer Profile Mode", label_visibility="collapsed", options=["Dynamic (from file)", "Fixed Standard"])
+            if profile_mode == "Fixed Standard":
+                st.sidebar.header("Fixed Standard Values")
+                ideal_income = st.sidebar.number_input("Ideal Income", value=65000)
+                ideal_home_value = st.sidebar.number_input("Ideal Home Value", value=180000)
+                ideal_owner = st.sidebar.number_input("Ideal Owner Occupied %", value=75)
+                ideal_year_built = st.sidebar.number_input("Ideal Median Year Built", value=1995)
+                ideal_distance = st.sidebar.number_input("Ideal Distance (miles for Profile Match)", value=25)
+            else:
+                # Dynamic profile based on existing customers in file
+                st.sidebar.header("Dynamic Profile (from file)")
+                cutoff = df['House Count'].quantile(0.75)
+                top = df[df['House Count'] >= cutoff]
+                ideal_income = top['$ Income'].mean()
+                ideal_home_value = top['$ Home Value'].mean()
+                ideal_owner = top['Owner Occupied'].mean()
+                ideal_year_built = top['Median Year Structure Built'].mean()
+                ideal_distance = top['Distance'].mean()
 
         # --- Score generation trigger ---
         if st.button("🚀 Generate Scores & Report"):
