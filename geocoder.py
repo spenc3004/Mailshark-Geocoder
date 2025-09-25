@@ -126,12 +126,28 @@ else:
     uploaded_file = st.file_uploader("Upload your Penetration Report (CSV or XLSX):", type=['csv', 'xlsx'])
 
     if uploaded_file:
+
+
         # Load the file into DataFrame
         if uploaded_file.name.lower().endswith('.csv'):
             df = pd.read_csv(uploaded_file)
         elif uploaded_file.name.lower().endswith('.xlsx'):
             df = pd.read_excel(uploaded_file)
-
+        # File validation
+        if preset_choice == "Home SRVCS Acquisition (No History)":
+            required_columns = ['$ Income', '$ Home Value', 'Owner Occupied', 'Median Year Structure Built', 'Distance']
+            file_columns = df.columns
+            if not all(col in file_columns for col in required_columns):
+                st.error(f"File is missing required columns for preset '{preset_choice}': {required_columns}")
+                st.stop()
+        else:
+            required_columns = ['$ Income', '$ Home Value', 'Owner Occupied', 'Median Year Structure Built',
+                                'House Count', 'House Penetration%', '$ Total Spend', 'Total Visits',
+                                '$ Average Order', 'Distance', 'Selected']
+            file_columns = df.columns
+            if not all(col in file_columns for col in required_columns):
+                st.error(f"File is missing required columns: {required_columns}")
+                st.stop()
         st.write("✅ File loaded:", uploaded_file.name)
         st.write("Cleaning the file and forcing numbers...")
 
@@ -181,7 +197,6 @@ else:
         # --- Score generation trigger ---
         if st.button("🚀 Generate Scores & Report"):
             working = df.copy()
-
             # Normalize selected fields
             for col in ['$ Income', '$ Home Value', 'Owner Occupied', 'Median Year Structure Built',
                         'House Count', 'House Penetration%', '$ Total Spend', 'Total Visits',
@@ -231,7 +246,7 @@ else:
                     working['Weighted Penetration Score'] = wps
                 else:
                     st.warning("⚠️ Missing data for Weighted Penetration Score. Skipping this metric.")
-                    weights['Weighted Penetration Score'] = 0
+                    working['Weighted Penetration Score_Norm'] = 0.0
 
             # Calculate Customer Profile Match Score
             pairs = [
