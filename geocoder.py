@@ -199,23 +199,39 @@ else:
                     if col == 'Distance':
                         working[f"{col}_Norm"] = 1 - working[f"{col}_Norm"]
 
-            # Calculate Weighted Penetration Score
-            if all(col in working.columns for col in ['$ Total Spend', 'Total Visits', 'Selected']):
-                working['Weighted Penetration Score'] = (working['$ Total Spend'] + working['Total Visits']) / working['Selected'].replace(0, np.nan)
-                working['Weighted Penetration Score'] = working['Weighted Penetration Score'].replace([np.inf, -np.inf], np.nan)
-                working['Weighted Penetration Score'] = working['Weighted Penetration Score'].fillna(0)
-                wp_min = working['Weighted Penetration Score'].min()
-                wp_max = working['Weighted Penetration Score'].max()
-                if wp_max > wp_min:
-                    # Avoid division by zero
-                    # Making it 0.0 will not affect the Composite Score
-                    working['Weighted Penetration Score_Norm'] = (working['Weighted Penetration Score'] - wp_min) / (wp_max - wp_min)
+                # Calculate Weighted Penetration Score with adaptive winsorization
+                if all(col in working.columns for col in ['$ Total Spend', 'Total Visits', 'Selected']):
+                    wps = (working['$ Total Spend'] + working['Total Visits']) / working['Selected'].replace(0, np.nan)
+                    wps = wps.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+                    # --- Adaptive winsorization using IQR ---
+                    q1 = wps.quantile(0.25)
+                    q3 = wps.quantile(0.75)
+                    iqr = q3 - q1
+                    # typical Tukey fences (you can adjust 1.5)
+                    lower_fence = q1 - 1.5 * iqr
+                    upper_fence = q3 + 1.5 * iqr
+
+                    # Clip only if we actually detect outliers
+                    has_outliers = (wps > upper_fence).any() or (wps < lower_fence).any()
+                    if has_outliers:
+                        wps_clipped = wps.clip(lower_fence, upper_fence)
+                    else:
+                        wps_clipped = wps  # clean data → no clipping
+
+                    # --- Min–max normalize on the winsorized series ---
+                    wp_min = wps_clipped.min()
+                    wp_max = wps_clipped.max()
+                    if wp_max > wp_min:
+                        working['Weighted Penetration Score_Norm'] = (wps_clipped - wp_min) / (wp_max - wp_min)
+                    else:
+                        st.warning("⚠️ Weighted Penetration Score has no spread. Skipping normalization.")
+                        working['Weighted Penetration Score_Norm'] = 0.0
+                    # Keep raw WPS too, if you still need it downstream
+                    working['Weighted Penetration Score'] = wps
                 else:
-                    st.warning("⚠️ Invalid data for Weighted Penetration Score. Skipping this metric.")
-                    working['Weighted Penetration Score_Norm'] = 0.0
-            else:
-                st.warning("⚠️ Missing data for Weighted Penetration Score. Skipping this metric.")
-                weights['Weighted Penetration Score'] = 0
+                    st.warning("⚠️ Missing data for Weighted Penetration Score. Skipping this metric.")
+                    weights['Weighted Penetration Score'] = 0
 
             # Calculate Customer Profile Match Score
             pairs = [
