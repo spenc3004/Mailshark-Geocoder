@@ -189,7 +189,13 @@ else:
                 if col in working.columns:
                     min_val = working[col].min()
                     max_val = working[col].max()
-                    working[f"{col}_Norm"] = (working[col] - min_val) / (max_val - min_val)
+                    if max_val > min_val:
+                        working[f"{col}_Norm"] = (working[col] - min_val) / (max_val - min_val)
+                    else:
+                        # Avoid division by zero won't let NaN affect ranking
+                        # Making it 0.0 means it will just multiple by it's weight resulting 0 not affecting the score
+                        working[f"{col}_Norm"] = 0.0  
+                    # Invert Distance normalization (lower is better)
                     if col == 'Distance':
                         working[f"{col}_Norm"] = 1 - working[f"{col}_Norm"]
 
@@ -200,23 +206,38 @@ else:
                 working['Weighted Penetration Score'] = working['Weighted Penetration Score'].fillna(0)
                 wp_min = working['Weighted Penetration Score'].min()
                 wp_max = working['Weighted Penetration Score'].max()
-                working['Weighted Penetration Score_Norm'] = (working['Weighted Penetration Score'] - wp_min) / (wp_max - wp_min)
+                if wp_max > wp_min:
+                    # Avoid division by zero
+                    # Making it 0.0 will not affect the Composite Score
+                    working['Weighted Penetration Score_Norm'] = (working['Weighted Penetration Score'] - wp_min) / (wp_max - wp_min)
+                else:
+                    st.warning("⚠️ Invalid data for Weighted Penetration Score. Skipping this metric.")
+                    working['Weighted Penetration Score_Norm'] = 0.0
             else:
                 st.warning("⚠️ Missing data for Weighted Penetration Score. Skipping this metric.")
                 weights['Weighted Penetration Score'] = 0
 
             # Calculate Customer Profile Match Score
+            pairs = [
+                ('$ Income', ideal_income),
+                ('$ Home Value', ideal_home_value),
+                ('Median Year Structure Built', ideal_year_built),
+                ('Distance', ideal_distance)
+            ]
+
             diffs = []
-            for field, ideal in zip(['$ Income', '$ Home Value', 'Median Year Structure Built', 'Distance'],
-                                    [ideal_income, ideal_home_value, ideal_year_built, ideal_distance]):
+            denom_ideals = []
+
+            for field, ideal in pairs:
                 if field in working.columns:
                     if field == 'Distance':
                         diff = np.where(working[field] <= ideal, 0, working[field] - ideal)
                     else:
                         diff = np.where(working[field] >= ideal, 0, ideal - working[field])
                     diffs.append(diff)
-            if diffs:
-                match_score = 1 - (np.sum(diffs, axis=0) / np.sum([ideal_income, ideal_home_value, ideal_year_built, ideal_distance]))
+                    denom_ideals.append(ideal)
+            if diffs and denom_ideals:
+                match_score = 1 - (np.sum(diffs, axis=0) / np.sum(denom_ideals))
                 match_score = np.clip(match_score, 0, 1)
                 working['Customer Profile Match Score'] = match_score
 
