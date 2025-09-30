@@ -10,7 +10,7 @@ import requests
 import base64
 
 # === Adaptive Winsorization Function ===
-def adaptive_minmax_iqr(s: pd.Series) -> pd.Series:
+def adaptive_minmax_iqr(s):
     """
     Adaptive winsorization + min-max:
     - Detect outliers via Tukey IQR (Q1 ± 1.5*IQR).
@@ -247,31 +247,8 @@ else:
                     wps = (working['$ Total Spend'] + working['Total Visits']) / working['Selected'].replace(0, np.nan)
                     wps = wps.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-                    # --- Adaptive winsorization using IQR ---
-                    q1 = wps.quantile(0.25)
-                    q3 = wps.quantile(0.75)
-                    iqr = q3 - q1
-                    # typical Tukey fences (you can adjust 1.5)
-                    lower_fence = q1 - 1.5 * iqr
-                    upper_fence = q3 + 1.5 * iqr
-
-                    # Clip only if we actually detect outliers
-                    has_outliers = (wps > upper_fence).any() or (wps < lower_fence).any()
-                    if has_outliers:
-                        wps_clipped = wps.clip(lower_fence, upper_fence)
-                    else:
-                        wps_clipped = wps  # clean data → no clipping
-
-                    # --- Min–max normalize on the winsorized series ---
-                    wp_min = wps_clipped.min()
-                    wp_max = wps_clipped.max()
-                    if wp_max > wp_min:
-                        working['Weighted Penetration Score_Norm'] = (wps_clipped - wp_min) / (wp_max - wp_min)
-                    else:
-                        st.warning("⚠️ Weighted Penetration Score has no spread. Skipping normalization.")
-                        working['Weighted Penetration Score_Norm'] = 0.0
-                    # Keep raw WPS too, if you still need it downstream
                     working['Weighted Penetration Score'] = wps
+                    working['Weighted Penetration Score_Norm'] = adaptive_minmax_iqr(wps)
                 else:
                     st.warning("⚠️ Missing data for Weighted Penetration Score. Skipping this metric.")
                     working['Weighted Penetration Score_Norm'] = 0.0
