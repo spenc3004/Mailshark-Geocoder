@@ -9,6 +9,35 @@ from dotenv import load_dotenv
 import requests
 import base64
 
+# === Adaptive Winsorization Function ===
+def adaptive_minmax_iqr(s: pd.Series) -> pd.Series:
+    """
+    Adaptive winsorization + min-max:
+    - Detect outliers via Tukey IQR (Q1 ± 1.5*IQR).
+    - If outliers exist, clip to fences; else leave as-is.
+    - Min-max normalize to [0,1].
+    - Empty/constant → 0.0s.
+    """
+    s = pd.to_numeric(s, errors='coerce')
+    s_nonnull = s.dropna()
+    if s_nonnull.empty:
+        return pd.Series(0.0, index=s.index)
+
+    q1, q3 = s_nonnull.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    if iqr > 0:
+        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        has_outliers = (s_nonnull < lower).any() or (s_nonnull > upper).any()
+        s_clip = s.clip(lower, upper) if has_outliers else s
+    else:
+        s_clip = s
+
+    mn, mx = s_clip.min(), s_clip.max()
+    if pd.isna(mn) or pd.isna(mx) or mx <= mn:
+        return pd.Series(0.0, index=s.index)
+
+    return ((s_clip - mn) / (mx - mn)).reindex(s.index).fillna(0.0)
+
 # === Load environment variables (e.g., API endpoint for authentication) ===
 load_dotenv()
 API_SERVER = os.getenv("API_SERVER")
@@ -186,6 +215,7 @@ else:
             else:
                 # Dynamic profile based on existing customers in file
                 st.sidebar.header("Dynamic Profile (from file)")
+                st.sidebar.info("Ideal values computed from top 25% House Count in the file.")
                 cutoff = df['House Count'].quantile(0.75)
                 top = df[df['House Count'] >= cutoff]
                 ideal_income = top['$ Income'].mean()
@@ -197,22 +227,20 @@ else:
         # --- Score generation trigger ---
         if st.button("🚀 Generate Scores & Report"):
             working = df.copy()
-            # Normalize selected fields
+            # Normalize selected fields with adaptive winsorization
             for col in ['$ Income', '$ Home Value', 'Owner Occupied', 'Median Year Structure Built',
                         'House Count', 'House Penetration%', '$ Total Spend', 'Total Visits',
                         '$ Average Order', 'Distance']:
-                if col in working.columns:
-                    min_val = working[col].min()
-                    max_val = working[col].max()
-                    if max_val > min_val:
-                        working[f"{col}_Norm"] = (working[col] - min_val) / (max_val - min_val)
-                    else:
-                        # Avoid division by zero won't let NaN affect ranking
-                        # Making it 0.0 means it will just multiple by it's weight resulting 0 not affecting the score
-                        working[f"{col}_Norm"] = 0.0  
-                    # Invert Distance normalization (lower is better)
-                    if col == 'Distance':
-                        working[f"{col}_Norm"] = 1 - working[f"{col}_Norm"]
+                if col not in working.columns:
+                    continue
+
+                norm = adaptive_minmax_iqr(working[col])
+
+                if col == 'Distance':
+                    norm = 1 - norm  # Invert distance (closer is better)
+
+                working[f"{col}_Norm"] = norm
+
 
                 # Calculate Weighted Penetration Score with adaptive winsorization
                 if all(col in working.columns for col in ['$ Total Spend', 'Total Visits', 'Selected']):
