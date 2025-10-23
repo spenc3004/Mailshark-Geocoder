@@ -78,6 +78,10 @@ def adaptive_minmax_iqr(s: pd.Series, col_name: str, id_series: pd.Series | None
     return norm, audit
 
 
+def top_quartile_subset(frame: pd.DataFrame, by_col: str) -> pd.DataFrame:
+    q = frame[by_col].quantile(0.75)
+    return frame[frame[by_col] >= q]
+
 # === Load environment variables (e.g., API endpoint for authentication) ===
 load_dotenv()
 API_SERVER = os.getenv("API_SERVER")
@@ -160,7 +164,7 @@ else:
                     '$ Total Spend': 0.00,
                     'Total Visits': 0.00,
                     '$ Average Order': 0.00,
-                    'Distance': 0.25,
+                    'Distance': (-0.25),
                     'Weighted Penetration Score': 0.00,
                     'Customer Profile Match Score': 0.00
                 },
@@ -174,7 +178,7 @@ else:
                     '$ Total Spend': 0.07,
                     'Total Visits': 0.03,
                     '$ Average Order': 0.05,
-                    'Distance': 0.07,
+                    'Distance': (-0.07),
                     'Weighted Penetration Score': 0.15,
                     'Customer Profile Match Score': 0.20
                 },
@@ -188,7 +192,7 @@ else:
                     '$ Total Spend': 0.13,
                     'Total Visits': 0.07,
                     '$ Average Order': 0.10,
-                    'Distance': 0.07,
+                    'Distance': (-0.07),
                     'Weighted Penetration Score': 0.05,
                     'Customer Profile Match Score': 0.10
                 }
@@ -203,7 +207,7 @@ else:
                 '$ Total Spend': 0.10,
                 'Total Visits': 0.05,
                 '$ Average Order': 0.05,
-                'Distance': 0.05,
+                'Distance': (-0.05),
                 'Weighted Penetration Score': 0.10,
                 'Customer Profile Match Score': 0.10
             },
@@ -237,7 +241,7 @@ else:
             "presets": {
                 "Manual": {},
                 "Auto Acquisition (No History)": {
-                    'Distance': 0.35,
+                    'Distance': (-0.35),
                     '$ Income': 0.25,
                     '5+ Vehicles': 0.20,
                     '% 4 Vehicles': 0.12,
@@ -248,7 +252,7 @@ else:
                 },
                 "Auto Acquisition (With History + No Suppression)": {
                     'House Count': 0.020,
-                    'Distance': 0.15,
+                    'Distance': (-0.15),
                     '$ Total Spend': 0.12,
                     '$ Average Order': 0.10,
                     '$ Income': 0.07,
@@ -263,7 +267,7 @@ else:
                 }
             },
             "fallback_weights": {
-                'Distance': 0.35,
+                'Distance': (-0.35),
                 '$ Income': 0.25,
                 '5+ Vehicles': 0.20,
                 '% 4 Vehicles': 0.12,
@@ -303,15 +307,20 @@ else:
     st.title("📬 Mail Shark Geocode Scoring Tool")
 
     # --- Select scoring mode from sidebar ---
-    category = st.sidebar.selectbox("Select Category", list(CATEGORY_CONFIG.keys()))
-    preset_choice = st.sidebar.selectbox("Select Scoring Mode", list(get_category_presets(category).keys()))
-    DEFAULT_WEIGHTS = get_default_weights(category, preset_choice)
+    st.sidebar.header("Scoring Configuration")
+    category_options = ["— Select a category —"] + list(CATEGORY_CONFIG.keys())
+    category = st.sidebar.selectbox("Select Category", category_options, index=0)
+
+    preset_choice = None
+    if category != "— Select a category —":
+        preset_choice = st.sidebar.selectbox("Select Scoring Mode", list(get_category_presets(category).keys()))
+        DEFAULT_WEIGHTS = get_default_weights(category, preset_choice)
 
 
     # --- Upload penetration report file ---
     uploaded_file = st.file_uploader("Upload your Penetration Report (CSV or XLSX):", type=['csv', 'xlsx'])
 
-    if uploaded_file:
+    if uploaded_file and category != "— Select a category —":
         # Load the file into DataFrame
         if uploaded_file.name.lower().endswith('.csv'):
             df = pd.read_csv(uploaded_file)
@@ -350,14 +359,19 @@ else:
                 (key == 'Customer Profile Match Score' and feature(category, "use_cpms"))
             )
             if has_raw or is_allowed_derived:
-                weights[key] = st.sidebar.slider(f"{key} Weight", 0.0, 1.0, float(default), 0.01)
+                weights[key] = st.sidebar.slider(f"{key} Weight", -1.0, 1.0, float(default), 0.01)
 
         # --- Fail Filter thresholds ---
         st.sidebar.header("Fail Filter Thresholds")
         min_income = st.sidebar.number_input("Min Household Income ($)", value=40000)
+        if category == "Automotive" and "$ Income" in df.columns:
+            max_income = st.sidebar.number_input("Max Household Income ($)", value=250000)
+        else:
+            max_income = None
         max_distance = st.sidebar.number_input("Max Distance (miles)", value=50)
         min_owner = st.sidebar.number_input("Min Owner Occupied (%)", value=70) if 'Owner Occupied' in df.columns else None
-        max_penetration = st.sidebar.number_input("Max House Penetration (%)", value=100.0) if 'House Penetration%' in df.columns else None
+        max_penetration = st.sidebar.number_input("Max House Penetration (%)", value=11.0) if 'House Penetration%' in df.columns else None
+
 
         # --- Customer Profile Mode ---
 
@@ -389,16 +403,39 @@ else:
             elif profile_mode == "Dynamic (from file)":
                 # Dynamic profile based on existing customers in file
                 st.sidebar.header("Dynamic Profile (from file)")
-                driver_candidates = ['House Count', '$ Income', '$ Home Value', 'Owner Occupied', 'Median Year Structure Built', 'Distance']
-                driver = st.selectbox("Select Driver for Ideal Profile Calculation", options=[col for col in driver_candidates if col in df.columns], index=0)
-                st.sidebar.info(f"Ideal values computed from top 25% {driver} in the file.")
-                cutoff = df[driver].quantile(0.75)
-                top = df[df[driver] >= cutoff]
-                ideal_income = top['$ Income'].mean()
-                ideal_home_value = top['$ Home Value'].mean()
-                ideal_owner = top['Owner Occupied'].mean()
-                ideal_year_built = top['Median Year Structure Built'].mean()
-                ideal_distance = top['Distance'].mean()
+                driver_candidates = ['House Count', 'House Penetration%', '$ Total Spend', 'Total Visits', '$ Average Order']
+                available_drivers = [c for c in driver_candidates if c in df.columns]
+                if not available_drivers:
+                    st.sidebar.warning("⚠️ No valid driver columns found in file for Dynamic profile calculation.")
+                else:
+                    driver = st.sidebar.selectbox("Select Driver for Ideal Profile Calculation", options=available_drivers, index=0)
+                    st.sidebar.info(f"Ideal values computed from top 25% {driver} in the file.")
+
+
+
+                    ideal_map = {
+                        "$ Income": "Ideal Income",
+                        "$ Home Value": "Ideal Home Value",
+                        "Owner Occupied": "Ideal Owner Occupied",
+                        "Median Year Structure Built": "Ideal Median Year Built",
+                        "Distance": "Ideal Distance",
+                    }
+                    profiles = {}
+                    for drv in available_drivers:
+                        top = top_quartile_subset(df, by_col=drv)
+                        profiles[drv] = {
+                            row_name: (top[col].mean() if col in top.columns else None)
+                            for col, row_name in ideal_map.items()
+                        }
+
+                    profiles_df = pd.DataFrame(profiles)
+                    profiles_df.index.name = "Ideal"
+
+                    ideal_income        = profiles_df.loc["Ideal Income", driver]                     if "Ideal Income" in profiles_df.index else None
+                    ideal_home_value    = profiles_df.loc["Ideal Home Value", driver]                 if "Ideal Home Value" in profiles_df.index else None
+                    ideal_owner         = profiles_df.loc["Ideal Owner Occupied", driver]             if "Ideal Owner Occupied" in profiles_df.index else None
+                    ideal_year_built    = profiles_df.loc["Ideal Median Year Built", driver]          if "Ideal Median Year Built" in profiles_df.index else None
+                    ideal_distance      = profiles_df.loc["Ideal Distance", driver]                   if "Ideal Distance" in profiles_df.index else None
 
         # --- Score generation trigger ---
         if st.button("🚀 Generate Scores & Report"):
@@ -410,13 +447,11 @@ else:
             # union of (valid weights keys) and some known numeric fields like Distance
             predictors_to_normalize = set()
             predictors_to_normalize |= set([k for k in valid_weight_keys.keys() if k in working.columns])
-            predictors_to_normalize.add("Distance")  # we always invert this if present
+            predictors_to_normalize.add("Distance")  
 
             for col in predictors_to_normalize:
                 try:
                     norm, audit = adaptive_minmax_iqr(working[col], col_name=col, id_series=id_series)
-                    if col == 'Distance':
-                        norm = 1 - norm  # closer is better
                     working[f"{col}_Norm"] = norm
                     winsor_audits.append(audit)
                 except Exception:
@@ -471,7 +506,7 @@ else:
             # Composite scoring calculation
             score = np.zeros(len(working))
             for key, w in weights.items():
-                if w <= 0:
+                if w == 0:
                     continue
                 if key == 'Customer Profile Match Score' and key in working.columns:
                     score += working[key] * w
@@ -489,6 +524,7 @@ else:
                     "⚠️ Above Max Penetration", ""
                 )
             working['Status'] = np.where(
+                ((max_income is None) | (working['$ Income'] <= max_income)) &
                 (working['$ Income'] >= min_income) &
                 (working['Distance'] <= max_distance) &
                 (working['Owner Occupied'] >= min_owner),
@@ -568,9 +604,13 @@ else:
                 pd.DataFrame(base_summary).to_excel(writer, sheet_name='Summary', index=False, startrow=0)
 
                 # Write winsor summary below it, with a blank row in between
-                startrow = len(base_summary["Note"] or 1) + 2
+                startrow = (len(base_summary["Note"]) or 1) + 2
                 if not audit_summary_df.empty:
                     audit_summary_df.to_excel(writer, sheet_name='Summary', index=False, startrow=startrow)
+
+                # Write profiles
+                if profile_mode == "Dynamic (from file)" and not profiles_df.empty:
+                    profiles_df.to_excel(writer, sheet_name='Summary', index=True, startrow=startrow + len(audit_summary_df) + 2)
 
                 # Detailed sheet
                 if not winsor_details_df.empty:
