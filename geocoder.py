@@ -3,16 +3,52 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import matplotlib.pyplot as plt
+import seaborn as sns
+import openpyxl
+
+from sklearn.model_selection import train_test_split, cross_val_score, KFold, cross_validate
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score, median_absolute_error, make_scorer
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.base import clone
+
+from scikeras.wrappers import KerasRegressor
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+
 import io
 import os
 from dotenv import load_dotenv
 import requests
 import base64
+from openpyxl.chart import BarChart, Reference
 
 
 # === Helper Functions ===
 
-# === Adaptive Winsorization Function (with audit) ===
+def feature(category, name):
+    return CATEGORY_CONFIG[category]["features"].get(name, False)
+
+def get_category_presets(category):
+    return CATEGORY_CONFIG[category]["presets"]
+
+def get_default_weights(category, preset):
+    presets = get_category_presets(category)
+    w = presets.get(preset, {})
+    if w:
+        return w
+    return CATEGORY_CONFIG[category]["fallback_weights"]
+
+def required_columns_for(category, preset):
+    base = CATEGORY_CONFIG[category]["required_columns_base"]
+    extra = CATEGORY_CONFIG[category]["required_columns_by_preset"].get(preset, [])
+    return list(dict.fromkeys(base + extra))  # preserve order, remove duplicates
+
 def adaptive_minmax_iqr(s: pd.Series, col_name: str, id_series: pd.Series | None = None):
     """
     Adaptive winsorization + min-max to [0,1], WITH AUDIT INFO.
@@ -80,10 +116,123 @@ def adaptive_minmax_iqr(s: pd.Series, col_name: str, id_series: pd.Series | None
     norm = ((s_clip - mn) / (mx - mn)).reindex(s.index).fillna(0.0)
     return norm, audit
 
+def read_uploaded_file(uploaded_file):
+    """Load a Streamlit-uploaded CSV or XLSX file into a DataFrame."""
+    filename = uploaded_file.name.lower()
+    if filename.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    if filename.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file)
+    raise ValueError(f"Unsupported file type: {uploaded_file.name}")
+
+def coerce_numeric_columns(frame: pd.DataFrame, columns: list[str]) -> None:
+    """Coerce selected columns to numeric in-place when present."""
+    for col in columns:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
 
 def top_quartile_subset(frame: pd.DataFrame, by_col: str) -> pd.DataFrame:
     q = frame[by_col].quantile(0.75)
     return frame[frame[by_col] >= q]
+
+def bracket_revenue_summary(
+    frame: pd.DataFrame,
+    value_col: str,
+    revenue_col: str,
+    brackets: list[tuple[int, int | None, str]],
+) -> pd.DataFrame:
+    values = pd.to_numeric(frame[value_col], errors="coerce")
+    revenue = pd.to_numeric(frame[revenue_col], errors="coerce").fillna(0)
+
+    rows = []
+    for lower, upper, label in brackets:
+        if upper is None:
+            mask = values >= lower
+        else:
+            mask = (values >= lower) & (values <= upper)
+        rows.append({"Bracket": label, "Total Revenue": float(revenue[mask].sum())})
+
+    return pd.DataFrame(rows)
+
+def add_revenue_histograms_sheet(
+    writer: pd.ExcelWriter,
+    working_df: pd.DataFrame,
+    revenue_col: str,
+):
+    income_brackets = [
+        (0, 39_999, "0-39,999"),
+        (40_000, 74_999, "40,000-74,999"),
+        (75_000, 149_999, "75,000-149,999"),
+        (150_000, 174_999, "150,000-174,999"),
+        (175_000, 249_999, "175,000-249,999"),
+        (250_000, None, "250,000+"),
+    ]
+    home_value_brackets = [
+        (0, 149_999, "0-149,999"),
+        (150_000, 249_999, "150,000-249,999"),
+        (250_000, 399_999, "250,000-399,999"),
+        (400_000, 749_999, "400,000-749,999"),
+        (750_000, 999_999, "750,000-999,999"),
+        (1_000_000, None, "1,000,000+"),
+    ]
+
+    sheet_name = "Revenue Histograms"
+    income_df = bracket_revenue_summary(working_df, "$ Income", revenue_col, income_brackets)
+    home_value_df = bracket_revenue_summary(working_df, "$ Home Value", revenue_col, home_value_brackets)
+
+    income_startrow = 0
+    income_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=income_startrow)
+
+    home_value_startrow = income_startrow + len(income_df) + 4
+    home_value_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=home_value_startrow)
+
+    ws = writer.sheets[sheet_name]
+
+    income_chart = BarChart()
+    income_chart.type = "col"
+    income_chart.title = "Revenue by Income Bracket"
+    income_chart.y_axis.title = "Total Revenue"
+    income_chart.x_axis.title = "Income Bracket"
+    income_data = Reference(
+        ws,
+        min_col=2,
+        min_row=income_startrow + 1,
+        max_row=income_startrow + len(income_df) + 1,
+    )
+    income_cats = Reference(
+        ws,
+        min_col=1,
+        min_row=income_startrow + 2,
+        max_row=income_startrow + len(income_df) + 1,
+    )
+    income_chart.add_data(income_data, titles_from_data=True)
+    income_chart.set_categories(income_cats)
+    income_chart.height = 12
+    income_chart.width = 20
+    ws.add_chart(income_chart, "D2")
+
+    home_chart = BarChart()
+    home_chart.type = "col"
+    home_chart.title = "Revenue by Home Value Bracket"
+    home_chart.y_axis.title = "Total Revenue"
+    home_chart.x_axis.title = "Home Value Bracket"
+    home_data = Reference(
+        ws,
+        min_col=2,
+        min_row=home_value_startrow + 1,
+        max_row=home_value_startrow + len(home_value_df) + 1,
+    )
+    home_cats = Reference(
+        ws,
+        min_col=1,
+        min_row=home_value_startrow + 2,
+        max_row=home_value_startrow + len(home_value_df) + 1,
+    )
+    home_chart.add_data(home_data, titles_from_data=True)
+    home_chart.set_categories(home_cats)
+    home_chart.height = 12
+    home_chart.width = 20
+    ws.add_chart(home_chart, f"D{home_value_startrow + 2}")
 
 def write_ranked_workbook(
     writer: pd.ExcelWriter,
@@ -113,6 +262,116 @@ def write_ranked_workbook(
     if not winsor_details_df.empty:
         winsor_details_df.to_excel(writer, sheet_name='Winsorized Rows', index=False)
 
+    revenue_col = None
+    if "$ Total Spend" in working_df.columns:
+        revenue_col = "$ Total Spend"
+    elif "Overall Revenue" in working_df.columns:
+        revenue_col = "Overall Revenue"
+    elif "Revenue" in working_df.columns:
+        revenue_col = "Revenue"
+
+    if revenue_col and "$ Income" in working_df.columns and "$ Home Value" in working_df.columns:
+        add_revenue_histograms_sheet(writer, working_df, revenue_col)
+    else:
+        sheet_name = "Revenue Histograms"
+        pd.DataFrame(
+            {
+                "Note": [
+                    "Revenue histograms not generated. Missing $ Income, $ Home Value, or revenue column."
+                ]
+            }
+        ).to_excel(writer, sheet_name=sheet_name, index=False)
+
+# === Modeling Helper Functions ===
+
+def smape(y_true, y_pred, eps=1e-8):
+    """
+    Symmetric MAPE in percent (0..200-ish).
+    Handles zeros by adding eps to denominator.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    denom = (np.abs(y_true) + np.abs(y_pred)) + eps
+    return float(100.0 * np.mean(2.0 * np.abs(y_pred - y_true) / denom))
+
+def mean_error(y_true, y_pred):
+    """Signed bias: positive => overpredict, negative => underpredict"""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return float(np.mean(y_pred - y_true))
+
+# For champion ranking, bias should be "closer to 0 is better":
+def abs_mean_error(y_true, y_pred):
+    return abs(mean_error(y_true, y_pred))
+
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+# sklearn scorers: set greater_is_better=False for "lower is better"
+SCORING = {
+    "r2": "r2",
+    "rmse": make_scorer(rmse, greater_is_better=False),
+    "medae": make_scorer(median_absolute_error, greater_is_better=False),
+    "smape": make_scorer(smape, greater_is_better=False),
+    "me": make_scorer(mean_error, greater_is_better=False),      # report signed (not used for rank)
+    "abs_me": make_scorer(abs_mean_error, greater_is_better=False) # used for rank
+}
+
+CV = KFold(n_splits=5, shuffle=True, random_state=42)
+
+def crossval_report(model, X, y, needs_scaling: bool):
+    """
+    Runs CV and returns mean/std for metrics.
+    Uses imputer (fill 0) and optional scaler inside each fold.
+    """
+    steps = [("imputer", SimpleImputer(strategy="constant", fill_value=0))]
+    if needs_scaling:
+        steps.append(("scaler", StandardScaler()))
+    steps.append(("model", model))
+
+    pipe = Pipeline(steps)
+
+    res = cross_validate(pipe, X, y, scoring=SCORING, cv=CV, n_jobs=-1, return_train_score=False)
+
+    # Remember: for scorers with greater_is_better=False, sklearn returns negative values
+    out = {
+        "R2_mean": res["test_r2"].mean(),
+        "R2_std":  res["test_r2"].std(),
+
+        "RMSE_mean": (-res["test_rmse"]).mean(),
+        "RMSE_std":  (-res["test_rmse"]).std(),
+
+        "MedAE_mean": (-res["test_medae"]).mean(),
+        "MedAE_std":  (-res["test_medae"]).std(),
+
+        "SMAPE_mean": (-res["test_smape"]).mean(),
+        "SMAPE_std":  (-res["test_smape"]).std(),
+
+        # Signed ME (flip sign back)
+        "MeanError_mean": (-res["test_me"]).mean(),
+        "MeanError_std":  (-res["test_me"]).std(),
+
+        # abs(mean error) for ranking (flip sign back)
+        "AbsMeanError_mean": (-res["test_abs_me"]).mean(),
+        "AbsMeanError_std":  (-res["test_abs_me"]).std(),
+    }
+    return out
+
+def make_model_pipeline(model, needs_scaling: bool):
+    steps = [("imputer", SimpleImputer(strategy="constant", fill_value=0))]
+    if needs_scaling:
+        steps.append(("scaler", StandardScaler()))
+    steps.append(("model", model))
+    return Pipeline(steps)
+
+def build_nn(n_features):
+    model = Sequential([
+        Dense(32, activation="relu", input_shape=(n_features,)),
+        Dense(16, activation="relu"),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    return model
 
 # === Load environment variables (e.g., API endpoint for authentication) ===
 load_dotenv()
@@ -165,9 +424,11 @@ else:
             "features": {
                 "use_wps": True,
                 "use_cpms": True,
+                "use_vds": False,
                 "profile_modes": ["Dynamic (from file)", "Fixed Standard"]
             },
             "currency_columns": ["$ Income", "$ Home Value", "$ Total Spend", "$ Average Order"],
+            "percentage_columns": [],
             "required_columns_base": [
                 '$ Income', '$ Home Value', 'Owner Occupied',
                 'Median Year Structure Built', 'Distance'
@@ -255,9 +516,11 @@ else:
             "features": {
                 "use_wps": False,
                 "use_cpms": False,
+                "use_vds": True,
                 "profile_modes": []
             },
             "currency_columns": ["$ Income", "$ Home Value", "$ Total Spend", "$ Average Order"],
+            "percentage_columns": ['5+ Vehicles', '% 4 Vehicles', '% 3 Vehicles', '% 2 Vehicles', '% 1 Vehicle', '% No Vehicle'],
             "required_columns_base": [
                 'Distance', '$ Income', '5+ Vehicles', '% 4 Vehicles', '% 3 Vehicles', 
                 '% 2 Vehicles', '% 1 Vehicle', '% No Vehicle'
@@ -275,62 +538,27 @@ else:
                 "Auto Acquisition (No History)": {
                     'Distance': (-0.35),
                     '$ Income': 0.25,
-                    '5+ Vehicles': 0.20,
-                    '% 4 Vehicles': 0.12,
-                    '% 3 Vehicles': 0.07,
-                    '% 2 Vehicles': 0.05,
-                    '% 1 Vehicle': 0.03,
-                    '% No Vehicle': (-0.07)
+                    'Vehicle Density Score': 0.20,
                 },
                 "Auto Acquisition (With History + No Suppression)": {
-                    'House Count': 0.020,
-                    'Distance': (-0.15),
-                    '$ Total Spend': 0.12,
-                    '$ Average Order': 0.10,
+                    'House Count': 0.23,
+                    'Distance': (-0.10),
+                    '$ Total Spend': 0.17,
+                    '$ Average Order': 0.11,
                     '$ Income': 0.07,
-                    'House Penetration%': 0.05,
-                    'Total Visits': 0.05,
-                    '5+ Vehicles': 0.15,
-                    '% 4 Vehicles': 0.07,
-                    '% 3 Vehicles': 0.05,
-                    '% 2 Vehicles': 0.04,
-                    '% 1 Vehicle': 0.02,
-                    '% No Vehicle': (-0.07)    
+                    'House Penetration%': 0.06,
+                    'Total Visits': 0.06,
+                    'Vehicle Density Score': 0.15,   
                 }
             },
             "fallback_weights": {
                 'Distance': (-0.35),
                 '$ Income': 0.25,
-                '5+ Vehicles': 0.20,
-                '% 4 Vehicles': 0.12,
-                '% 3 Vehicles': 0.07,
-                '% 2 Vehicles': 0.05,
-                '% 1 Vehicle': 0.03,
-                '% No Vehicle': (-0.07)
+                'Vehicle Density Score': 0.20,
             },  
             "profile_defaults": {}
         }
     }
-
-    # === Helper functions ===
-
-    def feature(category, name):
-        return CATEGORY_CONFIG[category]["features"].get(name, False)
-
-    def get_category_presets(category):
-        return CATEGORY_CONFIG[category]["presets"]
-
-    def get_default_weights(category, preset):
-        presets = get_category_presets(category)
-        w = presets.get(preset, {})
-        if w:
-            return w
-        return CATEGORY_CONFIG[category]["fallback_weights"]
-
-    def required_columns_for(category, preset):
-        base = CATEGORY_CONFIG[category]["required_columns_base"]
-        extra = CATEGORY_CONFIG[category]["required_columns_by_preset"].get(preset, [])
-        return list(dict.fromkeys(base + extra))  # preserve order, remove duplicates
 
     # === Main Streamlit App ===
 
@@ -358,10 +586,7 @@ else:
 
         if uploaded_file and category != "— Select a category —":
             # Load the file into DataFrame
-            if uploaded_file.name.lower().endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            elif uploaded_file.name.lower().endswith('.xlsx'):
-                df = pd.read_excel(uploaded_file)
+            df = read_uploaded_file(uploaded_file)
 
             # File validation
             required_cols = required_columns_for(category, preset_choice)
@@ -378,6 +603,13 @@ else:
                 if col in df.columns:
                     df[col] = df[col].replace(r'[\$,]', '', regex=True).astype(float)
 
+            # Convert percentage fields from whole numebers to percents
+            if len(CATEGORY_CONFIG[category]["percentage_columns"]) > 0:
+                for col in CATEGORY_CONFIG[category]["percentage_columns"]:
+                    if col in df.columns:
+                        df[col] = df[col].astype(float) / 100.0
+            # No percentage columns to process when list is empty.
+
             # --- Weight sliders ---
             st.sidebar.header("Adjust Weights & Filters")
             valid_weight_keys = dict(DEFAULT_WEIGHTS)
@@ -386,13 +618,16 @@ else:
                 valid_weight_keys.pop('Weighted Penetration Score', None)
             if not feature(category, "use_cpms"):
                 valid_weight_keys.pop('Customer Profile Match Score', None)
+            if not feature(category, "use_vds"):
+                valid_weight_keys.pop('Vehicle Density Score', None)
 
             weights = {}
             for key, default in valid_weight_keys.items():
                 has_raw = key in df.columns
                 is_allowed_derived =(
                     (key == 'Weighted Penetration Score' and feature(category, "use_wps")) or
-                    (key == 'Customer Profile Match Score' and feature(category, "use_cpms"))
+                    (key == 'Customer Profile Match Score' and feature(category, "use_cpms")) or
+                    (key == 'Vehicle Density Score' and feature(category, "use_vds"))
                 )
                 if has_raw or is_allowed_derived:
                     weights[key] = st.sidebar.slider(f"{key} Weight", -1.0, 1.0, float(default), 0.01)
@@ -539,6 +774,33 @@ else:
                         match_score = np.clip(match_score, 0, 1)
                         working['Customer Profile Match Score'] = match_score
 
+                # Calculate Vehicle Density Score
+                if feature(category, "use_vds"):
+                    VEHICLE_COLUMNS = {
+                        '5+ Vehicles': 5,
+                        '% 4 Vehicles': 4,
+                        '% 3 Vehicles': 3,
+                        '% 2 Vehicles': 2,
+                        '% 1 Vehicle': 1,
+                        '% No Vehicle': -5
+                    }
+
+                    # Ensure missing vehicle columns do not crash the app
+                    for col in VEHICLE_COLUMNS.keys():
+                        if col not in working.columns:
+                            working[col] = 0
+
+                    # Calculate raw Vehicle Density Score
+                    vds = np.zeros(len(working))
+                    for col, points in VEHICLE_COLUMNS.items():
+                        vds += working[col] * points
+                        working['Vehicle Density Score'] = vds
+
+                                      
+                    vds_norm, vds_audit = adaptive_minmax_iqr(vds, col_name='Vehicle Density Score', id_series=id_series)
+                    winsor_audits.append(vds_audit)
+                    working['Vehicle Density Score_Norm'] = vds_norm
+
                 # Composite scoring calculation
                 score = np.zeros(len(working))
                 for key, w in weights.items():
@@ -548,6 +810,8 @@ else:
                         score += working[key] * w
                     elif key == 'Weighted Penetration Score' and 'Weighted Penetration Score_Norm' in working.columns:
                         score += working['Weighted Penetration Score_Norm'] * w
+                    elif key == 'Vehicle Density Score' and 'Vehicle Density Score_Norm' in working.columns:
+                        score += working['Vehicle Density Score_Norm'] * w
                     elif f"{key}_Norm" in working.columns:
                         score += working[f"{key}_Norm"] * w
 
@@ -646,14 +910,14 @@ else:
                 towrite = io.BytesIO()
                 with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
                     write_ranked_workbook(
-                    writer=writer,
-                    working_df=st.session_state["ranked_parts"]["working_df"],
-                    base_summary_dict=st.session_state["ranked_parts"]["base_summary_dict"],
-                    audit_summary_df=st.session_state["ranked_parts"]["audit_summary_df"],
-                    profiles_df=st.session_state["ranked_parts"]["profiles_df"],
-                    winsor_details_df=st.session_state["ranked_parts"]["winsor_details_df"],
-                    profile_mode=st.session_state["ranked_parts"]["profile_mode"],
-                )
+                        writer=writer,
+                        working_df=st.session_state["ranked_parts"]["working_df"],
+                        base_summary_dict=st.session_state["ranked_parts"]["base_summary_dict"],
+                        audit_summary_df=st.session_state["ranked_parts"]["audit_summary_df"],
+                        profiles_df=st.session_state["ranked_parts"]["profiles_df"],
+                        winsor_details_df=st.session_state["ranked_parts"]["winsor_details_df"],
+                        profile_mode=st.session_state["ranked_parts"]["profile_mode"],
+                    )
 
                 st.session_state["ranked_xlsx_bytes"] = towrite.getvalue()
 
@@ -681,17 +945,13 @@ else:
 
         if roi_file:
             st.write("✅ File loaded:", roi_file.name)
-            if roi_file.name.lower().endswith('.csv'):
-                roi_df = pd.read_csv(roi_file)
-            elif roi_file.name.lower().endswith('.xlsx'):
-                roi_df = pd.read_excel(roi_file)
-            
-
+            roi_df = read_uploaded_file(roi_file)
 
             # Ensure numeric for safe summations
-            for c in ["Mailing Qty", "RO's", "Responded", "Revenue", "Expense", "Response"]:
-                if c in roi_df.columns:
-                    roi_df[c] = pd.to_numeric(roi_df[c], errors="coerce")
+            coerce_numeric_columns(
+                roi_df,
+                ["Mailing Qty", "RO's", "Responded", "Revenue", "Expense", "Response"],
+            )
 
             # 1) Aggregate by Campaigns (one row per Campaign/Geocode)
             if "Campaigns" not in roi_df.columns:
@@ -731,18 +991,308 @@ else:
             merged = ranked_df.merge(roi_summary, left_on="Geocode", right_on="Campaigns", how="left")
 
             if st.button("Analyze"):
-                analysis = merged.copy()
+                data = merged.copy()
 
                 # 4) Hide the right-side key after merge
-                if "Campaigns" in analysis.columns:
-                    analysis = analysis.drop(columns=["Campaigns"])
+                if "Campaigns" in data.columns:
+                    data = data.drop(columns=["Campaigns"])
 
                 # Percentage
-                if "Response Rate" in analysis.columns:
-                    analysis["Response Rate %"] = (analysis["Response Rate"] * 100).round(2)
-
+                if "Response Rate" in data.columns:
+                    data["Response Rate %"] = (data["Response Rate"] * 100).round(2)
                 st.success("✅ ROI aggregated and merged successfully!")
-                st.dataframe(analysis)
+
+                data['Route_Activity'] = np.where(data['Times Mailed To'] >= 3, 'Active', 'Inactive')
+
+                active = data[data['Route_Activity'] == 'Active'].copy()
+                inactive = data[data['Route_Activity'] == 'Inactive'].copy()
+
+                candidate_predictors = [
+                    'Composite Score',
+                    '$ Average Order_Norm',
+                    'Total Visits_Norm',
+                    '$ Income_Norm',
+                    '$ Total Spend_Norm',
+                    'House Penetration%_Norm',
+                    'Owner Occupied_Norm',
+                    'Median Year Structure Built_Norm',
+                    'Distance_Norm',
+                    '$ Home Value_Norm',
+                    'House Count_Norm',
+                    'Weighted Penetration Score_Norm',
+                    'Customer Profile Match Score',
+                    
+                ]
+
+                predictors = [c for c in candidate_predictors if c in data.columns]
+        
+                target = 'Overall ROAS'
+
+                # === Prepare Training Data ===
+
+                X = active[predictors].copy()
+
+                # Add missing indicators for training data
+                for col in X.columns:
+                    if X[col].isna().any():
+                        X[f"{col}_was_missing"] = X[col].isna().astype(int)
+
+                # Fill NaNs with 0
+                X_filled = X.fillna(0)
+
+                y = active[target]
+
+                # === Define Models ===
+                # Optional: keep a holdout split ONLY for your plots (not for champion selection)
+                X_train, X_val, y_train, y_val = train_test_split(
+                    X_filled, y, test_size=0.2, random_state=42
+                )
+
+                # Build the NN wrapper (don’t predict yet — it must be fit by sklearn/pipeline)
+                nn = KerasRegressor(
+                    model=build_nn,
+                    model__n_features=X_filled.shape[1],
+                    epochs=100,
+                    batch_size=16,
+                    verbose=0,
+                    random_state=42
+                )
+
+
+                models = {
+                    "Linear Regression": (LinearRegression(), True),
+                    "Decision Tree": (DecisionTreeRegressor(random_state=42), False),
+                    "Random Forest": (RandomForestRegressor(n_estimators=200, random_state=42), False),
+                    "Gradient Boosting": (GradientBoostingRegressor(n_estimators=200, learning_rate=0.1, random_state=42), False),
+                    "Neural Network": (nn, True),
+                }
+
+                # === Model Evaluation ===
+
+                cv_rows = {}
+                for name, (model, needs_scaling) in models.items():
+                    cv_rows[name] = crossval_report(model, X_filled, y, needs_scaling=needs_scaling)
+
+                cv_df = pd.DataFrame(cv_rows).T
+
+                # -----------------------
+                # Champion selection:
+                # 1) Rank by MEAN performance (AvgRank)
+                # 2) Tie-break by STABILITY (AvgStd: lower std is better)
+                # -----------------------
+                rank_cols = {
+                    "R2_mean": False,                
+                    "RMSE_mean": True,                
+                    "MedAE_mean": True,
+                    "SMAPE_mean": True,
+                    "AbsMeanError_mean": True,
+                }
+
+                # ranks based on MEANS
+                ranks = pd.DataFrame(index=cv_df.index)
+                for col, asc in rank_cols.items():
+                    ranks[col + "_rank"] = cv_df[col].rank(ascending=asc, method="average")
+
+                cv_df["AvgRank"] = ranks.mean(axis=1)
+
+                # STABILITY measures
+                # (R2_std isn't super useful here; we focus on error metrics)
+                std_cols = ["RMSE_std", "MedAE_std", "SMAPE_std", "AbsMeanError_std"]
+                cv_df["AvgStd"] = cv_df[std_cols].mean(axis=1)
+
+                # sort by AvgRank first, then AvgStd (tie-break)
+                cv_df = cv_df.sort_values(["AvgRank", "AvgStd"])
+
+                champion_name = cv_df.index[0]
+
+                st.subheader("Cross-Validated Model Comparison (5-fold)")
+                st.write(f"Champion (lowest AvgRank): **{champion_name}**")
+                st.dataframe(cv_df)
+                st.caption("AvgRank = mean-based ranking across metrics. AvgStd = tie-breaker (lower = more stable).")
+
+
+                # -----------------------
+                # Fit champion pipeline on ALL active data
+                # -----------------------
+                champ_model, champ_needs_scaling = models[champion_name]
+
+                champion_pipe = make_model_pipeline(clone(champ_model), champ_needs_scaling)
+                champion_pipe.fit(X_filled, y)
+
+                # === Residuals on FULL ACTIVE DATA (actuals) ===
+
+                # X_filled and y (from above) already represent all active rows
+                X_active_full = X_filled
+                y_active_full = y
+
+                # Champion predictions on FULL active data
+                active_preds = {}
+                active_preds[champion_name] = champion_pipe.predict(X_active_full)
+
+                residuals_df = active[['Overall ROAS']].copy()
+                residuals_df['Geocode'] = active['Geocode']
+
+                for name, preds in active_preds.items():
+                    residuals_df[f'{name}_residual'] = y_active_full - preds
+
+                
+                # === Flag Over / Under performers for each model ===
+
+                for name in active_preds.keys():
+                    col = f'{name}_residual'
+                    flag_col = f'{name}_performance'
+
+                    residuals_df[flag_col] = np.where(
+                        residuals_df[col] > 0,
+                        'Over-performer',      # actual > predicted
+                        np.where(
+                            residuals_df[col] < 0,
+                            'Under-performer',  # actual < predicted
+                            'On target'
+                        )
+                    )
+
+                # === Champion model over / under-performers ===
+
+                champ_residual_col = f'{champion_name}_residual'
+                champ_flag_col = f'{champion_name}_performance'
+
+                # Sort to find biggest over- and under-performers
+                top_over = residuals_df.sort_values(champ_residual_col, ascending=False).head(20)
+                top_under = residuals_df.sort_values(champ_residual_col, ascending=True).head(20)
+
+                st.subheader(f"Champion Model Over/Under Performers ({champion_name})")
+
+                st.write("**Top Over-performers (Actual ROAS > Predicted ROAS):**")
+                st.dataframe(top_over)
+
+                st.write("**Top Under-performers (Actual ROAS < Predicted ROAS):**")
+                st.dataframe(top_under)
+
+                # === Bar chart of champion residuals (using Geocode) ===
+                st.subheader(f"{champion_name} Residuals by Route (Active Data)")
+
+                # Keep only what we need for the plot
+                residuals_plot = residuals_df[['Geocode', champ_residual_col]].copy()
+
+                # Sort by residual so the bar chart is ordered
+                residuals_plot = residuals_plot.sort_values(champ_residual_col)
+
+                # Limit to 50 points for readability
+                residuals_plot = residuals_plot.head(50)
+
+                fig, ax = plt.subplots(figsize=(12, 6))
+                sns.barplot(
+                    data=residuals_plot,
+                    x='Geocode',                          
+                    y=champ_residual_col,
+                    ax=ax
+                )
+                ax.axhline(0, linestyle='--', color='red')
+                ax.set_xlabel("Geocode")
+                ax.set_ylabel("Residual (Actual - Predicted ROAS)")
+                ax.set_title(
+                    f"{champion_name} Residuals on Active Data\n"
+                    "(Above 0 = Over-performer, Below 0 = Under-performer)"
+                )
+                plt.xticks(rotation=90)
+                st.pyplot(fig)
+
+
+
+                # === Prepare Inactive Data for Prediction ===
+
+                X_inactive = inactive[predictors].copy()
+
+                # Handle missing indicators for inactive data
+                for col in predictors:
+                    if f"{col}_was_missing" in X_train.columns:
+                        if X_inactive[col].isna().any():
+                            st.warning(f"Column '{col}' has {X_inactive[col].isna().sum()} missing values. Filling with 0 and adding indicator column.")
+                        X_inactive[f"{col}_was_missing"] = X_inactive[col].isna().astype(int)
+
+                # Fill NaNs with 0
+                X_inactive_filled = X_inactive.fillna(0)
+
+
+                inactive['Predicted_ROAS'] = champion_pipe.predict(X_inactive_filled)
+
+
+                # === Build unified ranked routes table (active + inactive) ===
+
+                # Champion predictions for ACTIVE routes 
+                active_export = active.copy()
+                active_export['Route_Activity'] = 'Active'
+                active_export['Actual_ROAS'] = active[target]
+
+                # champion predictions on active data
+                active_export['Predicted_ROAS'] = active_preds[champion_name]
+
+                # residual + performance flag from residuals_df
+                active_export['Residual'] = residuals_df[champ_residual_col]
+                active_export['Performance_Flag'] = residuals_df[champ_flag_col]
+
+                # Keep only useful columns for export
+                active_export = active_export[[
+                    'Geocode',
+                    'Route_Activity',
+                    'Actual_ROAS',
+                    'Predicted_ROAS',
+                    'Residual',
+                    'Performance_Flag'
+                ]]
+
+                # INACTIVE routes export
+                inactive_export = inactive.copy()
+                inactive_export['Route_Activity'] = 'Inactive'
+                inactive_export['Actual_ROAS'] = np.nan
+                inactive_export['Residual'] = np.nan
+                inactive_export['Performance_Flag'] = 'Inactive'
+
+                inactive_export = inactive_export[[
+                    'Geocode',
+                    'Route_Activity',
+                    'Actual_ROAS',
+                    'Predicted_ROAS',
+                    'Residual',
+                    'Performance_Flag'
+                ]]
+
+                # Combine active + inactive
+                ranked_routes = pd.concat([active_export, inactive_export], ignore_index=True)
+
+                # Rank by predicted ROAS (highest first)
+                ranked_routes = ranked_routes.sort_values('Predicted_ROAS', ascending=False)
+                ranked_routes['Predicted_ROAS_Rank'] = ranked_routes['Predicted_ROAS'].rank(
+                    ascending=False,
+                    method='dense'
+                )
+
+                st.subheader("Ranked Routes (Active + Inactive)")
+                st.dataframe(ranked_routes.head(50))  
+
+                # === Build underperformer -> recommended route mapping (Sheet 2) ===
+
+                # Underperforming ACTIVE routes (most negative residuals first)
+                underperformers = active_export[active_export['Performance_Flag'] == 'Under-performer'] \
+                    .sort_values('Residual')  # most negative at top
+
+                # Recommended routes: INACTIVE with highest predicted ROAS
+                recommended_routes = inactive_export.sort_values('Predicted_ROAS', ascending=False)
+
+                # Pair them up 1-to-1 (min length of the two lists)
+                n_pairs = min(len(underperformers), len(recommended_routes))
+
+                mapping_df = pd.DataFrame({
+                    'Underperforming_Route_Geocode': underperformers['Geocode'].head(n_pairs).values,
+                    'Underperforming_Residual': underperformers['Residual'].head(n_pairs).values,
+                    'Recommended_Route_Geocode': recommended_routes['Geocode'].head(n_pairs).values,
+                    'Recommended_Predicted_ROAS': recommended_routes['Predicted_ROAS'].head(n_pairs).values
+                })
+
+                st.subheader("Underperformer → Recommended Route Mapping (Preview)")
+                st.dataframe(mapping_df.head(20))
+
 
 
                 out = io.BytesIO()
@@ -756,9 +1306,12 @@ else:
                         winsor_details_df=parts["winsor_details_df"],
                         profile_mode=parts["profile_mode"],
                 )
-                    analysis.to_excel(w, index=False, sheet_name='Ranked + ROI Summary')
+                    data.to_excel(w, index=False, sheet_name='Ranked + ROI Summary')
                     roi_summary.to_excel(w, index=False, sheet_name='ROI Summary by Campaign')
+                    ranked_routes.to_excel(w, index=False, sheet_name='Ranked Routes with Predictions')
+                    mapping_df.to_excel(w, index=False, sheet_name='Route Mapping')
 
+                out.seek(0)
 
                 st.download_button(
                     "📥 Download Ranked + ROI Summary",
@@ -766,3 +1319,25 @@ else:
                     file_name="ranked_with_roi_summary.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+                
+                # === Visualization ===
+                st.subheader("Champion Model Visualizations")
+
+                y_pred = champion_pipe.predict(X_val)  
+                residuals = y_val - y_pred
+
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+                sns.scatterplot(x=y_val, y=y_pred, ax=axes[0])
+                axes[0].plot([y_val.min(), y_val.max()], [y_val.min(), y_val.max()], 'r--')
+                axes[0].set_xlabel("Actual ROAS")
+                axes[0].set_ylabel("Predicted ROAS")
+                axes[0].set_title(f"{champion_name}: Actual vs Predicted")
+
+                sns.scatterplot(x=y_pred, y=residuals, ax=axes[1])
+                axes[1].axhline(0, color='r', linestyle='--')
+                axes[1].set_xlabel("Predicted ROAS")
+                axes[1].set_ylabel("Residuals")
+                axes[1].set_title(f"{champion_name}: Residuals")
+
+                st.pyplot(fig)
